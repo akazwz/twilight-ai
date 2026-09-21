@@ -18,11 +18,12 @@ type ModelDescriptor struct {
 }
 
 // Catalog returns the model routes documented at https://opencode.ai/docs/go/
-// on 2026-09-18. It is a routing directory, not a promise of account availability.
+// on 2026-09-21. It is a routing directory, not a promise of account availability.
 // ListModels queries the live catalog; WithModelProtocols adds or overrides
 // routes when the service introduces models or changes an endpoint.
 func Catalog() []ModelDescriptor {
 	return []ModelDescriptor{
+		{ID: "grok-4.7", DisplayName: "Grok 4.7", Protocol: ProtocolResponses},
 		{ID: "grok-4.6", DisplayName: "Grok 4.6", Protocol: ProtocolResponses},
 		{ID: "gpt-5.6-luna", DisplayName: "GPT 5.6 Luna", Protocol: ProtocolResponses},
 		{ID: "glm-5.3-flash", DisplayName: "GLM-5.3-Flash", Protocol: ProtocolCompletions},

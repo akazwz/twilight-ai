@@ -646,7 +646,7 @@ transports may also supply headers. See the [official client requirements](https
 | `ProtocolMessages` | `/messages` | `minimax-m2.7` |
 
 `Catalog()` returns the explicit model/protocol routes from the [official
-endpoint table](https://opencode.ai/docs/go/#endpoints), checked on 2026-09-18,
+endpoint table](https://opencode.ai/docs/go/#endpoints), checked on 2026-09-21,
 plus `deepseek-flash`, which the table omits but the live service lists and
 serves.
 `provider.ProtocolForModel(id)` exposes the routing decision for applications
