@@ -65,7 +65,7 @@ func TestChatProviderHeaders(t *testing.T) {
 					p := tc.new(server.URL, defaults)
 					defaults["X-Provider"] = "mutated"
 					parent := sdk.WithRequestHeaders(context.Background(), map[string]string{"x-trace": "parent", "X-Parent": "inherited"})
-					call := map[string]string{"X-TRACE": "call", "Authorization": "call-auth", "accept": "call-accept"}
+					call := map[string]string{"X-TRACE": "call", "Authorization": "call-auth", "accept": "call-accept", "content-type": "application/custom"}
 					ctx := sdk.WithRequestHeaders(parent, call)
 					call["X-TRACE"] = "mutated"
 					params := sdk.GenerateParams{Model: &sdk.Model{ID: "model", Provider: p}, Messages: []sdk.Message{sdk.UserMessage("hi")}}
@@ -108,6 +108,9 @@ func TestChatProviderHeaders(t *testing.T) {
 						if operation == "stream" && h.Get("Accept") != "text/event-stream" {
 							t.Errorf("stream Accept = %q", h.Get("Accept"))
 						}
+						if (operation == "generate" || operation == "stream") && h.Get("Content-Type") != "application/json" {
+							t.Errorf("%s Content-Type = %q", operation, h.Get("Content-Type"))
+						}
 					}
 				})
 			}
@@ -116,44 +119,48 @@ func TestChatProviderHeaders(t *testing.T) {
 }
 
 func TestOpenAIMediaHeaders(t *testing.T) {
+	const (
+		jsonContentType      = "application/json"
+		multipartContentType = "multipart/form-data; boundary="
+	)
 	cases := []struct {
-		name      string
-		multipart bool
-		call      func(context.Context, string, map[string]string)
+		name        string
+		contentType string // expected prefix; empty for bodiless requests
+		call        func(context.Context, string, map[string]string)
 	}{
-		{"embedding", false, func(ctx context.Context, url string, h map[string]string) {
+		{"embedding", jsonContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := embedding.New(embedding.WithBaseURL(url), embedding.WithHeaders(h))
 			_, _ = p.DoEmbed(ctx, sdk.EmbedParams{Model: p.EmbeddingModel("model"), Values: []string{"hi"}})
 		}},
-		{"image-generate", false, func(ctx context.Context, url string, h map[string]string) {
+		{"image-generate", jsonContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := images.New(images.WithBaseURL(url), images.WithHeaders(h))
 			_, _ = p.DoGenerate(ctx, &sdk.ImageGenerationParams{Model: p.GenerationModel("model"), Prompt: "hi"})
 		}},
-		{"image-edit-json", false, func(ctx context.Context, url string, h map[string]string) {
+		{"image-edit-json", jsonContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := images.New(images.WithBaseURL(url), images.WithHeaders(h))
 			_, _ = p.DoEdit(ctx, &sdk.ImageEditParams{Model: p.EditModel("model"), Prompt: "hi", Images: []sdk.ImageInput{{URL: "https://example.test/image.png"}}})
 		}},
-		{"image-edit-multipart", true, func(ctx context.Context, url string, h map[string]string) {
+		{"image-edit-multipart", multipartContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := images.New(images.WithBaseURL(url), images.WithHeaders(h))
 			_, _ = p.DoEdit(ctx, &sdk.ImageEditParams{Model: p.EditModel("model"), Prompt: "hi", Images: []sdk.ImageInput{{Data: []byte("image"), Filename: "image.png"}}})
 		}},
-		{"speech-list", false, func(ctx context.Context, url string, h map[string]string) {
+		{"speech-list", "", func(ctx context.Context, url string, h map[string]string) {
 			p := speech.New(speech.WithBaseURL(url), speech.WithHeaders(h))
 			_, _ = p.ListModels(ctx)
 		}},
-		{"speech-generate", false, func(ctx context.Context, url string, h map[string]string) {
+		{"speech-generate", jsonContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := speech.New(speech.WithBaseURL(url), speech.WithHeaders(h))
 			_, _ = p.DoSynthesize(ctx, sdk.SpeechParams{Model: p.SpeechModel("tts-1"), Text: "hi"})
 		}},
-		{"speech-stream", false, func(ctx context.Context, url string, h map[string]string) {
+		{"speech-stream", jsonContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := speech.New(speech.WithBaseURL(url), speech.WithHeaders(h))
 			_, _ = p.DoStream(ctx, sdk.SpeechParams{Model: p.SpeechModel("tts-1"), Text: "hi"})
 		}},
-		{"transcription-list", false, func(ctx context.Context, url string, h map[string]string) {
+		{"transcription-list", "", func(ctx context.Context, url string, h map[string]string) {
 			p := transcription.New(transcription.WithBaseURL(url), transcription.WithHeaders(h))
 			_, _ = p.ListModels(ctx)
 		}},
-		{"transcription", true, func(ctx context.Context, url string, h map[string]string) {
+		{"transcription", multipartContentType, func(ctx context.Context, url string, h map[string]string) {
 			p := transcription.New(transcription.WithBaseURL(url), transcription.WithHeaders(h))
 			_, _ = p.DoTranscribe(ctx, sdk.TranscriptionParams{Model: p.TranscriptionModel("whisper-1"), Audio: []byte("audio"), Filename: "audio.wav"})
 		}},
@@ -163,7 +170,7 @@ func TestOpenAIMediaHeaders(t *testing.T) {
 			seen := make(chan http.Header, 1)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				seen <- r.Header.Clone()
-				if tc.multipart {
+				if tc.contentType == multipartContentType {
 					if err := r.ParseMultipartForm(1024); err != nil {
 						t.Errorf("invalid multipart body: %v", err)
 					}
@@ -180,8 +187,8 @@ func TestOpenAIMediaHeaders(t *testing.T) {
 			if h.Get("X-Trace") != "call" || h.Get("X-Provider") != "kept" {
 				t.Fatalf("headers = %v", h)
 			}
-			if tc.multipart && !strings.HasPrefix(h.Get("Content-Type"), "multipart/form-data; boundary=") {
-				t.Fatalf("multipart boundary was overwritten: %v", h)
+			if tc.contentType != "" && !strings.HasPrefix(h.Get("Content-Type"), tc.contentType) {
+				t.Fatalf("Content-Type was overwritten, want prefix %q: %v", tc.contentType, h)
 			}
 		})
 	}

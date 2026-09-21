@@ -230,10 +230,10 @@ func (p *Provider) doRequest(ctx context.Context, model, text string, cfg audioC
 	if err != nil {
 		return nil, fmt.Errorf("openai speech: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 	for key, value := range p.requestHeaders(ctx) {
 		req.Header.Set(key, value)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

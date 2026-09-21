@@ -117,15 +117,18 @@ request-context headers**. Both APIs copy their input maps when called; mutating
 those maps later does not reconfigure a provider or context. Nested request
 contexts inherit headers and override matching names. Multiple `WithHeaders`
 provider options replace the provider header map; use one map to combine defaults.
-SSE negotiation headers, generated multipart boundaries, and AWS signing are
-applied after custom headers to preserve their transport requirements.
+SSE negotiation headers, the JSON body `Content-Type`, generated multipart
+boundaries, and AWS signing are applied after custom headers to preserve their
+transport requirements.
 
 Use a context per conversation for session IDs, and reuse it for tool
 continuations and retries. The same context can be passed to `ListModels`, `Test`
 and `TestModel`. This keeps session data out of shared provider state. Attach
 headers only to the provider calls that should receive them; child contexts
-inherit them, including calls made from tool handlers. Other provider packages
-may ignore request-context headers.
+inherit them, including calls made from tool handlers. For that reason, keep
+credentials such as `Authorization` in provider options rather than the context:
+a context header overrides the API key of every provider that receives it. Other
+provider packages may ignore request-context headers.
 
 ## OpenAI Completions Provider
 
