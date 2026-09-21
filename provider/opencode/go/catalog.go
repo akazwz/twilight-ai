@@ -33,6 +33,9 @@ func Catalog() []ModelDescriptor {
 		{ID: "kimi-k2.7-code", DisplayName: "Kimi K2.7 Code", Protocol: ProtocolCompletions},
 		{ID: "kimi-k2.6", DisplayName: "Kimi K2.6", Protocol: ProtocolCompletions},
 		{ID: "longcat-2.0", DisplayName: "LongCat-2.0", Protocol: ProtocolCompletions},
+		// Not in the endpoint table: listed by the live /models endpoint and
+		// verified against the service on 2026-09-20.
+		{ID: "deepseek-flash", DisplayName: "DeepSeek Flash", Protocol: ProtocolCompletions},
 		{ID: "deepseek-v4.1-flash", DisplayName: "DeepSeek V4.1 Flash", Protocol: ProtocolCompletions},
 		{ID: "deepseek-v4-pro", DisplayName: "DeepSeek V4 Pro", Protocol: ProtocolCompletions},
 		{ID: "deepseek-v4-flash", DisplayName: "DeepSeek V4 Flash", Protocol: ProtocolCompletions},

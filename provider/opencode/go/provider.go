@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 
 	"github.com/felinics/twilight/internal/utils"
 	"github.com/felinics/twilight/provider/anthropic/messages"
@@ -33,6 +34,8 @@ type Provider struct {
 	httpClient     *http.Client
 	headers        map[string]string
 	modelProtocols map[string]Protocol
+	displayNames   map[string]string
+	delegates      map[Protocol]sdk.Provider
 }
 
 var _ sdk.Provider = (*Provider)(nil)
@@ -72,12 +75,28 @@ func New(options ...Option) *Provider {
 		baseURL:        defaultBaseURL,
 		httpClient:     &http.Client{},
 		modelProtocols: make(map[string]Protocol),
+		displayNames:   make(map[string]string),
 	}
 	for _, model := range Catalog() {
 		p.modelProtocols[model.ID] = model.Protocol
+		p.displayNames[model.ID] = model.DisplayName
 	}
 	for _, option := range options {
 		option(p)
+	}
+	p.delegates = map[Protocol]sdk.Provider{
+		ProtocolCompletions: completions.New(
+			completions.WithAPIKey(p.apiKey), completions.WithBaseURL(p.baseURL),
+			completions.WithHTTPClient(p.httpClient), completions.WithHeaders(p.headers),
+		),
+		ProtocolResponses: responses.New(
+			responses.WithAPIKey(p.apiKey), responses.WithBaseURL(p.baseURL),
+			responses.WithHTTPClient(p.httpClient), responses.WithHeaders(p.headers),
+		),
+		ProtocolMessages: messages.New(
+			messages.WithAPIKey(p.apiKey), messages.WithBaseURL(p.baseURL),
+			messages.WithHTTPClient(p.httpClient), messages.WithHeaders(p.headers),
+		),
 	}
 	return p
 }
@@ -85,7 +104,7 @@ func New(options ...Option) *Provider {
 func (p *Provider) Name() string { return "opencode-go" }
 
 func (p *Provider) ChatModel(id string) *sdk.Model {
-	return &sdk.Model{ID: id, Provider: p, Type: sdk.ModelTypeChat}
+	return &sdk.Model{ID: id, DisplayName: p.displayNames[id], Provider: p, Type: sdk.ModelTypeChat}
 }
 
 // ProtocolForModel exposes the same routing decision used by generation and
@@ -115,7 +134,7 @@ func (p *Provider) ListModels(ctx context.Context) ([]sdk.Model, error) {
 		Method:  http.MethodGet,
 		BaseURL: p.baseURL,
 		Path:    "/models",
-		Headers: utils.RequestHeaders(ctx, utils.AuthHeader(p.apiKey), p.headers),
+		Headers: p.requestHeaders(ctx),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opencode-go: list models: %w", err)
@@ -169,7 +188,7 @@ func (p *Provider) DoGenerate(ctx context.Context, params sdk.GenerateParams) (*
 	if err != nil {
 		return nil, err
 	}
-	return delegate.DoGenerate(ctx, params)
+	return delegate.DoGenerate(ctx, p.paramsForModel(params))
 }
 
 func (p *Provider) DoStream(ctx context.Context, params sdk.GenerateParams) (*sdk.StreamResult, error) { //nolint:gocritic // interface method
@@ -180,7 +199,7 @@ func (p *Provider) DoStream(ctx context.Context, params sdk.GenerateParams) (*sd
 	if err != nil {
 		return nil, err
 	}
-	return delegate.DoStream(ctx, params)
+	return delegate.DoStream(ctx, p.paramsForModel(params))
 }
 
 func (p *Provider) providerForModel(id string) (sdk.Provider, error) {
@@ -188,23 +207,63 @@ func (p *Provider) providerForModel(id string) (sdk.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch protocol {
-	case ProtocolCompletions:
-		return completions.New(
-			completions.WithAPIKey(p.apiKey), completions.WithBaseURL(p.baseURL),
-			completions.WithHTTPClient(p.httpClient), completions.WithHeaders(p.headers),
-		), nil
-	case ProtocolResponses:
-		return responses.New(
-			responses.WithAPIKey(p.apiKey), responses.WithBaseURL(p.baseURL),
-			responses.WithHTTPClient(p.httpClient), responses.WithHeaders(p.headers),
-		), nil
-	case ProtocolMessages:
-		return messages.New(
-			messages.WithAPIKey(p.apiKey), messages.WithBaseURL(p.baseURL),
-			messages.WithHTTPClient(p.httpClient), messages.WithHeaders(p.headers),
-		), nil
-	default:
-		return nil, fmt.Errorf("opencode-go: unsupported protocol %q", protocol)
+	return p.delegates[protocol], nil
+}
+
+// paramsForModel adapts a request to how the service's Completions routes
+// behave, as observed against the live service rather than inferred from the
+// model family:
+//
+//   - Developer messages are sent as system messages. The routes accept the
+//     developer role, but several models silently ignore its content, while
+//     every model honors system messages, including mid-conversation ones.
+//   - A replayed assistant tool call always carries reasoning_content. Some
+//     routes reject the request otherwise, which happens when persisted history
+//     dropped the reasoning or the model emitted none; an empty value is
+//     accepted by every route.
+func (p *Provider) paramsForModel(params sdk.GenerateParams) sdk.GenerateParams { //nolint:gocritic // mirrors interface methods
+	if p.modelProtocols[params.Model.ID] != ProtocolCompletions {
+		return params
 	}
+	converted := slices.Clone(params.Messages)
+	for i := range converted {
+		switch converted[i].Role {
+		case sdk.MessageRoleDeveloper:
+			converted[i].Role = sdk.MessageRoleSystem
+		case sdk.MessageRoleAssistant:
+			converted[i].Content = padToolCallReasoning(converted[i].Content)
+		}
+	}
+	params.Messages = converted
+	return params
+}
+
+// padToolCallReasoning appends an empty Chat Completions reasoning block to a
+// tool-call message that has none, without modifying the caller's parts.
+func padToolCallReasoning(parts []sdk.MessagePart) []sdk.MessagePart {
+	hasToolCall := false
+	for _, part := range parts {
+		switch part := part.(type) {
+		case sdk.ToolCallPart:
+			hasToolCall = true
+		case sdk.ReasoningPart:
+			if part.Format == sdk.ReasoningFormatOpenAIChat {
+				return parts
+			}
+		}
+	}
+	if !hasToolCall {
+		return parts
+	}
+	return append(slices.Clone(parts), sdk.ReasoningPart{Format: sdk.ReasoningFormatOpenAIChat})
+}
+
+// requestHeaders omits Authorization when no key is configured, so the public
+// models endpoint is not sent an empty bearer token.
+func (p *Provider) requestHeaders(ctx context.Context) map[string]string {
+	var defaults map[string]string
+	if p.apiKey != "" {
+		defaults = utils.AuthHeader(p.apiKey)
+	}
+	return utils.RequestHeaders(ctx, defaults, p.headers)
 }

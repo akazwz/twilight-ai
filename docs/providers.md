@@ -646,12 +646,31 @@ transports may also supply headers. See the [official client requirements](https
 | `ProtocolMessages` | `/messages` | `minimax-m2.7` |
 
 `Catalog()` returns the explicit model/protocol routes from the [official
-endpoint table](https://opencode.ai/docs/go/#endpoints), checked on 2026-09-18.
+endpoint table](https://opencode.ai/docs/go/#endpoints), checked on 2026-09-18,
+plus `deepseek-flash`, which the table omits but the live service lists and
+serves.
 `provider.ProtocolForModel(id)` exposes the routing decision for applications
 that need protocol-specific reasoning or cache settings. Generic generation
 parameters, tools, reasoning metadata and stream events retain the selected
-protocol provider's behavior; the Go wrapper does not infer model-family
-compatibility flags or thinking modes.
+protocol provider's behavior. The Go wrapper does not infer model-family
+compatibility flags or thinking modes: OpenCode Go is its own service, and a
+model's name says nothing about which upstream serves it.
+
+Two adjustments apply to every Completions route. Both come from the service's
+observed behavior, verified on 2026-09-20, not from the model vendor's API:
+
+- Developer messages are sent as system messages. The routes accept the
+  developer role, but several models silently ignore its content, while every
+  model honors system messages.
+- A replayed assistant tool call always carries `reasoning_content`, empty when
+  the history has none. Some routes reject the request otherwise, and every
+  route accepts the empty value.
+
+Other upstream behavior passes through unchanged. `ReasoningEffort` is sent as
+`reasoning_effort`; the service maps `"none"` to disabled thinking on most
+routes, while `deepseek-v4-flash` ignores every thinking control and always
+reasons. `glm-5.3-flash` rejects a request that sets a reasoning effort with
+`MaxTokens` of 1024 or less.
 
 `ListModels(ctx)` fetches the live `/models` list, including new models. The
 upstream list does not include protocol metadata. A listed model can therefore

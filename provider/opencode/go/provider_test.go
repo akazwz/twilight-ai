@@ -152,6 +152,9 @@ func TestDiscoveryAndProbes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		if r.URL.Path == "/models" {
+			if values, ok := r.Header["Authorization"]; ok {
+				t.Errorf("keyless models request sent Authorization %q", values)
+			}
 			io.WriteString(w, `{"data":[{"id":"glm-5.2"},{"id":"future-model"}]}`)
 			return
 		}
@@ -188,6 +191,9 @@ func TestDiscoveryAndProbes(t *testing.T) {
 		if model.Provider != p {
 			t.Error("discovered model not bound to Go provider")
 		}
+	}
+	if models[0].DisplayName != "GLM-5.2" || models[1].DisplayName != "" {
+		t.Errorf("display names = %q, %q", models[0].DisplayName, models[1].DisplayName)
 	}
 	status := p.Test(context.Background())
 	if status.Status != sdk.ProviderStatusOK || !strings.Contains(status.Message, "TestModel") {
@@ -378,6 +384,105 @@ func checkProtocolRequest(t *testing.T, protocol opencodego.Protocol, step int32
 		}
 		if step == 2 && !strings.Contains(string(body["messages"]), "tool_result") {
 			t.Error("missing tool result")
+		}
+	}
+}
+
+// Both behaviors were confirmed against the live service: some Completions
+// routes reject a replayed tool call without reasoning_content, and several
+// models silently ignore the developer role. Neither depends on the model name.
+func TestCompletionsCompat(t *testing.T) {
+	type wireMessage struct {
+		Role             string  `json:"role"`
+		ReasoningContent *string `json:"reasoning_content"`
+	}
+	seen := make(chan []wireMessage, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []wireMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		seen <- body.Messages
+		reply(w, opencodego.ProtocolCompletions, "model", false, false)
+	}))
+	defer srv.Close()
+	p := opencodego.New(opencodego.WithBaseURL(srv.URL))
+	history := []sdk.Message{
+		sdk.DeveloperMessage("be brief"),
+		sdk.UserMessage("hi"),
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{ToolCallID: "call-1", ToolName: "lookup", Input: map[string]any{}}}},
+		sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call-1", ToolName: "lookup", Result: "found"}),
+	}
+	for _, model := range []string{"deepseek-v4-pro", "glm-5.2"} {
+		if _, err := p.DoGenerate(context.Background(), sdk.GenerateParams{Model: p.ChatModel(model), Messages: history}); err != nil {
+			t.Fatal(err)
+		}
+		if history[0].Role != sdk.MessageRoleDeveloper {
+			t.Fatal("caller messages were mutated")
+		}
+		messages := <-seen
+		if len(messages) != 4 || messages[0].Role != "system" {
+			t.Fatalf("%s: developer message sent as %+v", model, messages)
+		}
+		if messages[2].ReasoningContent == nil {
+			t.Errorf("%s: replayed tool call has no reasoning_content", model)
+		}
+		if len(history[2].Content) != 1 {
+			t.Fatal("caller message parts were mutated")
+		}
+	}
+}
+
+// Every catalog model must reach its documented endpoint with the request
+// shape of its protocol.
+func TestCatalogRoutes(t *testing.T) {
+	paths := map[opencodego.Protocol]string{
+		opencodego.ProtocolCompletions: "/chat/completions",
+		opencodego.ProtocolResponses:   "/responses",
+		opencodego.ProtocolMessages:    "/messages",
+	}
+	type request struct {
+		path  string
+		model string
+	}
+	seen := make(chan request, 1)
+	var protocol atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		seen <- request{r.URL.Path, body.Model}
+		reply(w, protocol.Load().(opencodego.Protocol), body.Model, false, false)
+	}))
+	defer srv.Close()
+	p := opencodego.New(opencodego.WithBaseURL(srv.URL))
+	ids := make(map[string]bool)
+	for _, entry := range opencodego.Catalog() {
+		if ids[entry.ID] {
+			t.Errorf("duplicate catalog entry %q", entry.ID)
+		}
+		ids[entry.ID] = true
+		if entry.DisplayName == "" || paths[entry.Protocol] == "" {
+			t.Errorf("incomplete catalog entry %+v", entry)
+			continue
+		}
+		protocol.Store(entry.Protocol)
+		model := p.ChatModel(entry.ID)
+		if model.DisplayName != entry.DisplayName {
+			t.Errorf("%s: display name = %q", entry.ID, model.DisplayName)
+		}
+		result, err := p.DoGenerate(context.Background(), sdk.GenerateParams{Model: model, Messages: []sdk.Message{sdk.UserMessage("hi")}})
+		if err != nil || result.Text != "done" {
+			t.Errorf("%s: result = %+v, err = %v", entry.ID, result, err)
+			continue
+		}
+		if got := <-seen; got.path != paths[entry.Protocol] || got.model != entry.ID {
+			t.Errorf("%s: request = %+v, want path %s", entry.ID, got, paths[entry.Protocol])
 		}
 	}
 }
