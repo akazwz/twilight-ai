@@ -62,13 +62,12 @@ func integrationContext(t *testing.T) context.Context {
 	return sdk.WithRequestHeaders(ctx, map[string]string{opencodego.SessionHeader: "twilight-integration-" + t.Name()})
 }
 
-func integrationLookupTool() sdk.Tool {
-	return sdk.Tool{
+func integrationLookupTool() sdk.ToolDefinition {
+	return sdk.ToolDefinition{
 		Name: "lookup", Description: "Look up a value by key",
 		Parameters: &jsonschema.Schema{
 			Type: "object", Properties: map[string]*jsonschema.Schema{"key": {Type: "string"}}, Required: []string{"key"},
 		},
-		Execute: func(_ *sdk.ToolExecContext, _ any) (any, error) { return "blue", nil },
 	}
 }
 
@@ -93,28 +92,38 @@ func TestIntegration_CatalogIsLive(t *testing.T) {
 	}
 }
 
-// A streamed multi-step tool loop replays each model's own reasoning. Whether
+// A streamed tool loop of up to four steps replays each model's own reasoning. Whether
 // the model chooses to call the tool is its decision; the request must succeed.
 func TestIntegration_StreamToolLoop(t *testing.T) {
 	p := newIntegrationProvider(t)
 	for _, entry := range integrationModels() {
 		t.Run(entry.ID, func(t *testing.T) {
 			t.Parallel()
-			stream, err := sdk.StreamText(integrationContext(t),
-				sdk.WithModel(p.ChatModel(entry.ID)), sdk.WithMaxSteps(4), sdk.WithTools([]sdk.Tool{integrationLookupTool()}),
-				sdk.WithMessages([]sdk.Message{sdk.UserMessage("Call the lookup tool with key 'color', then reply with only the value it returned.")}),
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := stream.ToResult()
-			if err != nil {
-				t.Fatal(err)
+			ctx := integrationContext(t)
+			model := p.ChatModel(entry.ID)
+			messages := []sdk.Message{sdk.UserMessage("Call the lookup tool with key 'color', then reply with only the value it returned.")}
+			var result *sdk.ModelResult
+			steps := 0
+			for steps < 4 {
+				steps++
+				stream, err := model.Stream(ctx, sdk.Request{Messages: messages, Tools: []sdk.ToolDefinition{integrationLookupTool()}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for range stream.Parts {
+				}
+				if result, err = stream.Result(); err != nil {
+					t.Fatal(err)
+				}
+				if len(result.ToolCalls) == 0 {
+					break
+				}
+				messages = append(messages, stepMessages(result, "blue")...)
 			}
 			if strings.TrimSpace(result.Text) == "" {
 				t.Errorf("empty text: %+v", result)
 			}
-			t.Logf("[%s] steps=%d text=%q", entry.Protocol, len(result.Steps), result.Text)
+			t.Logf("[%s] steps=%d text=%q", entry.Protocol, steps, result.Text)
 		})
 	}
 }
@@ -125,17 +134,21 @@ func TestIntegration_ReplayWithoutReasoning(t *testing.T) {
 	p := newIntegrationProvider(t)
 	maxTokens := 2048
 	effort := "high"
+	input, err := sdk.ToolArgumentsJSON(map[string]any{"key": "color"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	history := []sdk.Message{
 		sdk.UserMessage("Use lookup for key 'color', then tell me the result."),
-		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{ToolCallID: "call_1", ToolName: "lookup", Input: map[string]any{"key": "color"}}}},
-		sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call_1", ToolName: "lookup", Result: "blue"}),
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{ToolCallID: "call_1", ToolName: "lookup", Input: input}}},
+		sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call_1", ToolName: "lookup", Result: sdk.TextOutput("blue")}),
 	}
 	for _, entry := range integrationModels() {
 		t.Run(entry.ID, func(t *testing.T) {
 			t.Parallel()
-			result, err := p.DoGenerate(integrationContext(t), sdk.GenerateParams{
-				Model: p.ChatModel(entry.ID), MaxTokens: &maxTokens, ReasoningEffort: &effort,
-				Tools: []sdk.Tool{integrationLookupTool()}, Messages: history,
+			result, err := p.ChatModel(entry.ID).Generate(integrationContext(t), sdk.Request{
+				MaxTokens: &maxTokens, ReasoningEffort: &effort,
+				Tools: []sdk.ToolDefinition{integrationLookupTool()}, Messages: history,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -155,9 +168,9 @@ func TestIntegration_DeveloperInstruction(t *testing.T) {
 	for _, entry := range integrationModels() {
 		t.Run(entry.ID, func(t *testing.T) {
 			t.Parallel()
-			result, err := p.DoGenerate(integrationContext(t), sdk.GenerateParams{
-				Model: p.ChatModel(entry.ID), MaxTokens: &maxTokens,
-				Messages: []sdk.Message{sdk.DeveloperMessage("Always answer in uppercase."), sdk.UserMessage("Say: pong")},
+			result, err := p.ChatModel(entry.ID).Generate(integrationContext(t), sdk.Request{
+				MaxTokens: &maxTokens,
+				Messages:  []sdk.Message{sdk.DeveloperMessage("Always answer in uppercase."), sdk.UserMessage("Say: pong")},
 			})
 			if err != nil {
 				t.Fatal(err)

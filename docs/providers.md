@@ -102,14 +102,13 @@ provider := completions.New(
 ctx := sdk.WithRequestHeaders(context.Background(), map[string]string{
     "X-Conversation-ID": conversationID,
 })
-text, err := sdk.GenerateText(ctx,
-    sdk.WithModel(provider.ChatModel("gpt-4o-mini")),
-    sdk.WithMessages([]sdk.Message{sdk.UserMessage("Hello")}),
-)
+result, err := provider.ChatModel("gpt-4o-mini").Generate(ctx, sdk.Request{
+    Messages: []sdk.Message{sdk.UserMessage("Hello")},
+})
 if err != nil {
     log.Fatal(err)
 }
-fmt.Println(text)
+fmt.Println(result.Text)
 ```
 
 Header names are case-insensitive. Precedence is **defaults < provider headers <
@@ -121,12 +120,13 @@ SSE negotiation headers, the JSON body `Content-Type`, generated multipart
 boundaries, and AWS signing are applied after custom headers to preserve their
 transport requirements.
 
-Use a context per conversation for session IDs, and reuse it for tool
-continuations and retries. The same context can be passed to `ListModels`, `Test`
-and `TestModel`. This keeps session data out of shared provider state. Attach
-headers only to the provider calls that should receive them; child contexts
-inherit them, including calls made from tool handlers. For that reason, keep
-credentials such as `Authorization` in provider options rather than the context:
+Use a context per conversation for session IDs, and reuse it for every call in
+that conversation, including retries and the calls that replay tool results. The
+same context can be passed to `ListModels`, `Test` and `TestModel`. This keeps
+session data out of shared provider state. Attach headers only to the provider
+calls that should receive them; child contexts inherit them, including contexts
+derived for your own tool code. For that reason, keep credentials such as
+`Authorization` in provider options rather than the context:
 a context header overrides the API key of every provider that receives it. Other
 provider packages may ignore request-context headers.
 
@@ -620,19 +620,19 @@ provider := opencodego.New(
 ctx := sdk.WithRequestHeaders(context.Background(), map[string]string{
     opencodego.SessionHeader: conversationID,
 })
-text, err := sdk.GenerateText(ctx,
-    sdk.WithModel(provider.ChatModel("glm-5.2")),
-    sdk.WithMessages([]sdk.Message{sdk.UserMessage("Explain this code")}),
-)
+result, err := provider.ChatModel("glm-5.2").Generate(ctx, sdk.Request{
+    Messages: []sdk.Message{sdk.UserMessage("Explain this code")},
+})
 if err != nil {
     log.Fatal(err)
 }
-fmt.Println(text)
+fmt.Println(result.Text)
 ```
 
 OpenCode Go asks clients to identify their application with a User-Agent and
 send a stable `x-opencode-session` for each conversation. The caller owns that
-ID: keep it stable for the conversation, tool continuations and retries, and use
+ID: keep it stable for every call in the conversation, including tool-result
+replays and retries, and use
 a different context for a different conversation. The SDK neither generates a
 new session ID per request nor checks for one before sending; custom HTTP
 transports may also supply headers. See the [official client requirements](https://opencode.ai/docs/go/#where-can-i-use-it).
@@ -655,6 +655,12 @@ parameters, tools, reasoning metadata and stream events retain the selected
 protocol provider's behavior. The Go wrapper does not infer model-family
 compatibility flags or thinking modes: OpenCode Go is its own service, and a
 model's name says nothing about which upstream serves it.
+
+`Request.ProviderOptions` for this provider are keyed by its name,
+`"opencode-go"`, and are applied to the selected protocol's wire request as that
+protocol provider would apply its own. Options keyed by the protocol providers'
+namespaces (`"openai-completions"`, `"openai-responses"`,
+`"anthropic-messages"`) are not applied.
 
 Two adjustments apply to every Completions route. Both come from the service's
 observed behavior, verified on 2026-09-20, not from the model vendor's API:

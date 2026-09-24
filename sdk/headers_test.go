@@ -68,7 +68,7 @@ func TestChatProviderHeaders(t *testing.T) {
 					call := map[string]string{"X-TRACE": "call", "Authorization": "call-auth", "accept": "call-accept", "content-type": "application/custom"}
 					ctx := sdk.WithRequestHeaders(parent, call)
 					call["X-TRACE"] = "mutated"
-					params := sdk.GenerateParams{Model: &sdk.Model{ID: "model", Provider: p}, Messages: []sdk.Message{sdk.UserMessage("hi")}}
+					req := sdk.Request{Model: "model", Messages: []sdk.Message{sdk.UserMessage("hi")}}
 					switch operation {
 					case "list":
 						_, _ = p.ListModels(ctx)
@@ -77,13 +77,12 @@ func TestChatProviderHeaders(t *testing.T) {
 					case "probe":
 						_, _ = p.TestModel(ctx, "model")
 					case "generate":
-						_, _ = p.DoGenerate(ctx, params)
+						_, _ = p.DoGenerate(ctx, req)
 					case "stream":
-						stream, err := p.DoStream(ctx, params)
-						if err != nil {
-							t.Fatal(err)
+						if parts, err := p.DoStream(ctx, req); err == nil {
+							for range parts {
+							}
 						}
-						_, _ = stream.ToResult()
 					}
 					want := 1
 					if operation == "list" && tc.localCatalog {
@@ -205,8 +204,8 @@ func TestRequestHeadersBeforeBedrockSigning(t *testing.T) {
 	c := completions.New(completions.WithBaseURL(srv.URL), completions.WithHeaders(map[string]string{"X-Provider": "kept"}), completions.WithBedrockCredentials("us-east-1", "access", "secret", ""))
 	r := responses.New(responses.WithBaseURL(srv.URL), responses.WithHeaders(map[string]string{"X-Provider": "kept"}), responses.WithBedrockCredentials("us-east-1", "access", "secret", ""))
 	e := embedding.New(embedding.WithBaseURL(srv.URL), embedding.WithHeaders(map[string]string{"X-Provider": "kept"}), embedding.WithBedrockCredentials("us-east-1", "access", "secret", ""))
-	_, _ = c.DoGenerate(ctx, sdk.GenerateParams{Model: c.ChatModel("model")})
-	_, _ = r.DoGenerate(ctx, sdk.GenerateParams{Model: r.ChatModel("model")})
+	_, _ = c.DoGenerate(ctx, sdk.Request{Model: "model"})
+	_, _ = r.DoGenerate(ctx, sdk.Request{Model: "model"})
 	_, _ = e.DoEmbed(ctx, sdk.EmbedParams{Model: e.EmbeddingModel("model"), Values: []string{"hi"}})
 	if len(seen) != 3 {
 		t.Fatalf("saw %d requests", len(seen))

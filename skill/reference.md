@@ -1085,8 +1085,8 @@ func (p *Provider) ProtocolForModel(id string) (Protocol, error)
 func (p *Provider) ListModels(ctx context.Context) ([]sdk.Model, error)
 func (p *Provider) Test(ctx context.Context) *sdk.ProviderTestResult
 func (p *Provider) TestModel(ctx context.Context, modelID string) (*sdk.ModelTestResult, error)
-func (p *Provider) DoGenerate(ctx context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error)
-func (p *Provider) DoStream(ctx context.Context, params sdk.GenerateParams) (*sdk.StreamResult, error)
+func (p *Provider) DoGenerate(ctx context.Context, req sdk.Request) (sdk.ModelResult, error)
+func (p *Provider) DoStream(ctx context.Context, req sdk.Request) (<-chan sdk.StreamPart, error)
 ```
 
 Default base URL: `https://opencode.ai/zen/go/v1`. Supply your application's

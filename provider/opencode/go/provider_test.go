@@ -62,6 +62,9 @@ func TestGenerationAndToolContinuations(t *testing.T) {
 					if len(body["tools"]) == 0 {
 						t.Error("tools were dropped")
 					}
+					if string(body["top_p"]) != "0.5" {
+						t.Errorf("provider options were not applied: top_p = %s", body["top_p"])
+					}
 					checkProtocolRequest(t, route.protocol, step, body)
 					reply(w, route.protocol, route.model, stream, step == 1)
 				}))
@@ -69,24 +72,46 @@ func TestGenerationAndToolContinuations(t *testing.T) {
 				p := opencodego.New(opencodego.WithAPIKey("key"), opencodego.WithBaseURL(srv.URL+"/zen/go/v1"), opencodego.WithHeaders(map[string]string{"User-Agent": "test-agent/1.0", "X-Provider": "kept"}))
 				model := p.ChatModel(route.model)
 				ctx := sdk.WithRequestHeaders(context.Background(), map[string]string{opencodego.SessionHeader: "conversation-1"})
-				options := []sdk.GenerateOption{
-					sdk.WithModel(model), sdk.WithMessages([]sdk.Message{sdk.UserMessage("hi")}), sdk.WithMaxSteps(3), sdk.WithReasoningEffort("high"),
-					sdk.WithTools([]sdk.Tool{{Name: "lookup", Parameters: &jsonschema.Schema{Type: "object"}, Execute: func(_ *sdk.ToolExecContext, _ any) (any, error) { return "found", nil }}}),
+				effort := "high"
+				req := sdk.Request{
+					Messages: []sdk.Message{sdk.UserMessage("hi")}, ReasoningEffort: &effort,
+					Tools: []sdk.ToolDefinition{{Name: "lookup", Parameters: &jsonschema.Schema{Type: "object"}}},
+					// Only this provider's namespace reaches the delegate; the
+					// delegates' own namespaces would fail on the unknown member.
+					ProviderOptions: map[string]json.RawMessage{
+						"opencode-go":        json.RawMessage(`{"top_p":0.5}`),
+						"openai-completions": json.RawMessage(`{"unknown":true}`),
+						"openai-responses":   json.RawMessage(`{"unknown":true}`),
+						"anthropic-messages": json.RawMessage(`{"unknown":true}`),
+					},
 				}
-				var result *sdk.GenerateResult
-				var err error
-				if stream {
-					var sr *sdk.StreamResult
-					sr, err = sdk.StreamText(ctx, options...)
-					if err == nil {
-						result, err = sr.ToResult()
+				call := func() *sdk.ModelResult {
+					t.Helper()
+					if !stream {
+						result, err := model.Generate(ctx, req)
+						if err != nil {
+							t.Fatal(err)
+						}
+						return &result
 					}
-				} else {
-					result, err = sdk.GenerateTextResult(ctx, options...)
+					sr, err := model.Stream(ctx, req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range sr.Parts {
+					}
+					result, err := sr.Result()
+					if err != nil {
+						t.Fatal(err)
+					}
+					return result
 				}
-				if err != nil {
-					t.Fatal(err)
+				first := call()
+				if len(first.ToolCalls) != 1 {
+					t.Fatalf("first step = %+v", first)
 				}
+				req.Messages = append(req.Messages, stepMessages(first, "found")...)
+				result := call()
 				if result.Text != "done" || result.FinishReason != sdk.FinishReasonStop {
 					t.Fatalf("result = %+v", result)
 				}
@@ -138,7 +163,7 @@ func TestConcurrentSessionIsolation(t *testing.T) {
 			headers := map[string]string{opencodego.SessionHeader: session}
 			ctx := sdk.WithRequestHeaders(context.Background(), headers)
 			headers[opencodego.SessionHeader] = "mutated"
-			_, err := sdk.GenerateText(ctx, sdk.WithModel(p.ChatModel(routes[i%len(routes)].model)), sdk.WithMessages([]sdk.Message{sdk.UserMessage(session)}))
+			_, err := p.ChatModel(routes[i%len(routes)].model).Generate(ctx, sdk.Request{Messages: []sdk.Message{sdk.UserMessage(session)}})
 			if err != nil {
 				t.Error(err)
 			}
@@ -236,33 +261,45 @@ func TestExplicitRoutesAndInputValidation(t *testing.T) {
 		t.Fatal("built-in route not overridden")
 	}
 	for _, id := range []string{"", "unknown", "glm-future", "bad-model", "opencode-go/glm-5.2"} {
-		params := sdk.GenerateParams{Model: p.ChatModel(id)}
-		if _, err := p.DoGenerate(context.Background(), params); err == nil {
+		req := sdk.Request{Model: id}
+		if _, err := p.DoGenerate(context.Background(), req); err == nil {
 			t.Errorf("generated unknown model %q", id)
 		}
-		if _, err := p.DoStream(context.Background(), params); err == nil {
+		if _, err := p.DoStream(context.Background(), req); err == nil {
 			t.Errorf("streamed unknown model %q", id)
 		}
 		if _, err := p.TestModel(context.Background(), id); err == nil {
 			t.Errorf("probed unknown model %q", id)
 		}
 	}
-	if _, err := p.DoGenerate(context.Background(), sdk.GenerateParams{}); err == nil {
-		t.Error("nil model accepted")
-	}
-	if _, err := p.DoStream(context.Background(), sdk.GenerateParams{}); err == nil {
-		t.Error("nil streaming model accepted")
-	}
 	if requests.Load() != 0 {
 		t.Error("invalid inputs reached server")
 	}
-	_, err := p.DoGenerate(context.Background(), sdk.GenerateParams{Model: p.ChatModel("new-model"), Messages: []sdk.Message{sdk.UserMessage("hi")}})
+	_, err := p.DoGenerate(context.Background(), sdk.Request{Model: "new-model", Messages: []sdk.Message{sdk.UserMessage("hi")}})
 	if err != nil || requests.Load() != 1 {
 		t.Fatalf("explicit model: requests = %d, err = %v", requests.Load(), err)
 	}
 }
 
-// Replies exercise real protocol parsers and real tool-loop serialization.
+// stepMessages replays one step: the assistant message that made the calls,
+// with its reasoning and metadata, and output as the answer to each call.
+func stepMessages(r *sdk.ModelResult, output string) []sdk.Message {
+	var parts []sdk.MessagePart
+	for _, rp := range r.ReasoningParts {
+		parts = append(parts, rp)
+	}
+	if r.Text != "" {
+		parts = append(parts, sdk.TextPart{Text: r.Text, ProviderMetadata: r.TextProviderMetadata})
+	}
+	results := make([]sdk.ToolResultPart, 0, len(r.ToolCalls))
+	for _, c := range r.ToolCalls {
+		parts = append(parts, sdk.ToolCallPart{ToolCallID: c.ToolCallID, ToolName: c.ToolName, Input: c.Input, ProviderMetadata: c.ProviderMetadata})
+		results = append(results, sdk.ToolResultPart{ToolCallID: c.ToolCallID, ToolName: c.ToolName, Result: sdk.TextOutput(output)})
+	}
+	return []sdk.Message{{Role: sdk.MessageRoleAssistant, Content: parts}, sdk.ToolMessage(results...)}
+}
+
+// Replies exercise real protocol parsers and real tool-replay serialization.
 func reply(w http.ResponseWriter, protocol opencodego.Protocol, model string, stream, tool bool) {
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -337,23 +374,24 @@ func TestUpstreamErrorsAndCancellation(t *testing.T) {
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "upstream rejected request", status) }))
 				defer srv.Close()
 				p := opencodego.New(opencodego.WithBaseURL(srv.URL))
-				params := sdk.GenerateParams{Model: p.ChatModel(route.model), Messages: []sdk.Message{sdk.UserMessage("hi")}}
-				if _, err := p.DoGenerate(context.Background(), params); err == nil {
+				model := p.ChatModel(route.model)
+				req := sdk.Request{Messages: []sdk.Message{sdk.UserMessage("hi")}}
+				if _, err := model.Generate(context.Background(), req); err == nil {
 					t.Error("generation ignored upstream error")
 				}
-				sr, err := p.DoStream(context.Background(), params)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := sr.ToResult(); err == nil {
-					t.Error("stream ignored upstream error")
+				if sr, err := model.Stream(context.Background(), req); err == nil {
+					for range sr.Parts {
+					}
+					if _, err := sr.Result(); err == nil {
+						t.Error("stream ignored upstream error")
+					}
 				}
 				if _, err := p.TestModel(context.Background(), route.model); err == nil {
 					t.Error("probe ignored upstream error")
 				}
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
-				if _, err := p.DoGenerate(ctx, params); err == nil {
+				if _, err := model.Generate(ctx, req); err == nil {
 					t.Error("generation ignored cancellation")
 				}
 			})
@@ -412,11 +450,11 @@ func TestCompletionsCompat(t *testing.T) {
 	history := []sdk.Message{
 		sdk.DeveloperMessage("be brief"),
 		sdk.UserMessage("hi"),
-		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{ToolCallID: "call-1", ToolName: "lookup", Input: map[string]any{}}}},
-		sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call-1", ToolName: "lookup", Result: "found"}),
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{ToolCallID: "call-1", ToolName: "lookup", Input: sdk.ParseToolArguments("{}")}}},
+		sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call-1", ToolName: "lookup", Result: sdk.TextOutput("found")}),
 	}
 	for _, model := range []string{"deepseek-v4-pro", "glm-5.2"} {
-		if _, err := p.DoGenerate(context.Background(), sdk.GenerateParams{Model: p.ChatModel(model), Messages: history}); err != nil {
+		if _, err := p.DoGenerate(context.Background(), sdk.Request{Model: model, Messages: history}); err != nil {
 			t.Fatal(err)
 		}
 		if history[0].Role != sdk.MessageRoleDeveloper {
@@ -476,7 +514,7 @@ func TestCatalogRoutes(t *testing.T) {
 		if model.DisplayName != entry.DisplayName {
 			t.Errorf("%s: display name = %q", entry.ID, model.DisplayName)
 		}
-		result, err := p.DoGenerate(context.Background(), sdk.GenerateParams{Model: model, Messages: []sdk.Message{sdk.UserMessage("hi")}})
+		result, err := model.Generate(context.Background(), sdk.Request{Messages: []sdk.Message{sdk.UserMessage("hi")}})
 		if err != nil || result.Text != "done" {
 			t.Errorf("%s: result = %+v, err = %v", entry.ID, result, err)
 			continue

@@ -4,6 +4,7 @@ package opencodego
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -20,7 +21,7 @@ import (
 const (
 	defaultBaseURL = "https://opencode.ai/zen/go/v1"
 	// SessionHeader carries a caller-owned ID that stays stable across a
-	// conversation, including tool continuations and retries.
+	// conversation, including tool-result replays and retries.
 	SessionHeader = "x-opencode-session"
 )
 
@@ -169,8 +170,8 @@ func (p *Provider) Test(ctx context.Context) *sdk.ProviderTestResult {
 // as proof that generation works. This probe can incur upstream usage charges.
 func (p *Provider) TestModel(ctx context.Context, modelID string) (*sdk.ModelTestResult, error) {
 	maxTokens := 16
-	_, err := p.DoGenerate(ctx, sdk.GenerateParams{
-		Model:     p.ChatModel(modelID),
+	_, err := p.DoGenerate(ctx, sdk.Request{
+		Model:     modelID,
 		Messages:  []sdk.Message{sdk.UserMessage("hi")},
 		MaxTokens: &maxTokens,
 	})
@@ -180,26 +181,26 @@ func (p *Provider) TestModel(ctx context.Context, modelID string) (*sdk.ModelTes
 	return &sdk.ModelTestResult{Supported: true, Message: "supported"}, nil
 }
 
-func (p *Provider) DoGenerate(ctx context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error) { //nolint:gocritic // interface method
-	if params.Model == nil {
-		return nil, fmt.Errorf("opencode-go: model is required")
+func (p *Provider) DoGenerate(ctx context.Context, req sdk.Request) (sdk.ModelResult, error) { //nolint:gocritic // interface method
+	if req.Model == "" {
+		return sdk.ModelResult{}, fmt.Errorf("opencode-go: model is required")
 	}
-	delegate, err := p.providerForModel(params.Model.ID)
+	delegate, err := p.providerForModel(req.Model)
 	if err != nil {
-		return nil, err
+		return sdk.ModelResult{}, err
 	}
-	return delegate.DoGenerate(ctx, p.paramsForModel(params))
+	return delegate.DoGenerate(ctx, p.requestForModel(delegate, req))
 }
 
-func (p *Provider) DoStream(ctx context.Context, params sdk.GenerateParams) (*sdk.StreamResult, error) { //nolint:gocritic // interface method
-	if params.Model == nil {
+func (p *Provider) DoStream(ctx context.Context, req sdk.Request) (<-chan sdk.StreamPart, error) { //nolint:gocritic // interface method
+	if req.Model == "" {
 		return nil, fmt.Errorf("opencode-go: model is required")
 	}
-	delegate, err := p.providerForModel(params.Model.ID)
+	delegate, err := p.providerForModel(req.Model)
 	if err != nil {
 		return nil, err
 	}
-	return delegate.DoStream(ctx, p.paramsForModel(params))
+	return delegate.DoStream(ctx, p.requestForModel(delegate, req))
 }
 
 func (p *Provider) providerForModel(id string) (sdk.Provider, error) {
@@ -210,9 +211,13 @@ func (p *Provider) providerForModel(id string) (sdk.Provider, error) {
 	return p.delegates[protocol], nil
 }
 
-// paramsForModel adapts a request to how the service's Completions routes
-// behave, as observed against the live service rather than inferred from the
-// model family:
+// requestForModel hands the caller's "opencode-go" provider options to the
+// delegate under its own namespace, the only one it reads; options keyed by
+// any other namespace are not for this provider and are dropped.
+//
+// It also adapts a request to how the service's Completions routes behave, as
+// observed against the live service rather than inferred from the model
+// family:
 //
 //   - Developer messages are sent as system messages. The routes accept the
 //     developer role, but several models silently ignore its content, while
@@ -221,11 +226,16 @@ func (p *Provider) providerForModel(id string) (sdk.Provider, error) {
 //     routes reject the request otherwise, which happens when persisted history
 //     dropped the reasoning or the model emitted none; an empty value is
 //     accepted by every route.
-func (p *Provider) paramsForModel(params sdk.GenerateParams) sdk.GenerateParams { //nolint:gocritic // mirrors interface methods
-	if p.modelProtocols[params.Model.ID] != ProtocolCompletions {
-		return params
+func (p *Provider) requestForModel(delegate sdk.Provider, req sdk.Request) sdk.Request { //nolint:gocritic // mirrors interface methods
+	options := req.ProviderOptions[p.Name()]
+	req.ProviderOptions = nil
+	if len(options) > 0 {
+		req.ProviderOptions = map[string]json.RawMessage{delegate.Name(): options}
 	}
-	converted := slices.Clone(params.Messages)
+	if p.modelProtocols[req.Model] != ProtocolCompletions {
+		return req
+	}
+	converted := slices.Clone(req.Messages)
 	for i := range converted {
 		switch converted[i].Role {
 		case sdk.MessageRoleDeveloper:
@@ -234,8 +244,8 @@ func (p *Provider) paramsForModel(params sdk.GenerateParams) sdk.GenerateParams 
 			converted[i].Content = padToolCallReasoning(converted[i].Content)
 		}
 	}
-	params.Messages = converted
-	return params
+	req.Messages = converted
+	return req
 }
 
 // padToolCallReasoning appends an empty Chat Completions reasoning block to a

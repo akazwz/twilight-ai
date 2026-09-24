@@ -92,14 +92,13 @@ provider := opencodego.New(
 ctx := sdk.WithRequestHeaders(context.Background(), map[string]string{
     opencodego.SessionHeader: conversationID, // stable across turns and tool calls
 })
-text, err := sdk.GenerateText(ctx,
-    sdk.WithModel(provider.ChatModel("glm-5.2")),
-    sdk.WithMessages([]sdk.Message{sdk.UserMessage("Explain this code")}),
-)
+result, err := provider.ChatModel("glm-5.2").Generate(ctx, sdk.Request{
+    Messages: []sdk.Message{sdk.UserMessage("Explain this code")},
+})
 if err != nil {
     log.Fatal(err)
 }
-fmt.Println(text)
+fmt.Println(result.Text)
 ```
 
 Models route to Completions, Responses or Messages using an explicit catalog.
